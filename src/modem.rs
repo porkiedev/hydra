@@ -1,10 +1,12 @@
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
 use poll_promise::Promise;
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, trace, warn};
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumIter, EnumString};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -14,13 +16,15 @@ use tokio::sync::RwLock;
 
 /// A rough estimate of how long it takes for mercury to send a PENDING response to a CQFRAME request
 const CQ_DURATION_MILLIS: u128 = 2500;
+/// The maximum number of cq frames to store. Ideally this would eventually be user configurable
+const MAX_CQ_FRAMES: usize = 100;
 
 /// A handle to interface with the mercury modem
 ///
 /// This is also an async abstraction so I can call functions directly from the GUI without blocking
 #[derive(Debug)]
 pub struct Modem {
-    state: Arc<RwLock<State>>,
+    pub state: Arc<RwLock<State>>,
 }
 impl Default for Modem {
     fn default() -> Self {
@@ -32,6 +36,8 @@ impl Default for Modem {
 impl Modem {
     /// Whether we're connected to mercury or not
     pub fn is_mercury_connected(&self) -> bool { self.state.blocking_read().tcp_connection.is_some() }
+    /// Whether we're connected to another station or not
+    pub fn is_station_connected(&self) -> bool { self.state.blocking_read().connection.is_some() }
     /// The station we're connected to, if any
     pub fn get_connected_station(&self) -> Option<OpenConnection> { self.state.blocking_read().connection.clone() }
     /// Whether we're on cooldown from calling CQ
@@ -101,14 +107,14 @@ impl Modem {
         });
     }
     /// Send disconnect request to remote station
-    pub fn disconnect(&mut self) {
+    pub fn disconnect(&self) {
         info!("Sending disconnect request to remote station");
         self.write_to_control("DISCONNECT".into());
     }
     /// Send ARQ connect request to remote station
     /// - `source` is the initiating callsign, i.e. the current station
     /// - `destination` is the destination callsign that you're trying to connect to
-    pub fn connect(&mut self, source: &str, destination: &str) {
+    pub fn connect(&self, source: &str, destination: &str) {
         info!("Attempting connection: {source} -> {destination}");
         self.write_to_control(format!("CONNECT {source} {destination}"));
     }
@@ -256,7 +262,20 @@ impl Modem {
                         warn!("Received unknown bandwidth value from a CQFRAME packet: {bandwidth_part}");
                         continue;
                     };
-                    trace!("Received CQFRAME from {source_part} (BW: {bandwidth_part}");
+                    trace!("Received CQFRAME from {source_part} (BW: {bandwidth_part})");
+
+                    let mut l = s.write().await;
+                    // Remove old frames once we reach the limit
+                    if l.cq_frames.len() >= MAX_CQ_FRAMES {
+                        l.cq_frames.pop_front();
+                    }
+                    // Add the new frame to the vec
+                    l.cq_frames.push_back(CqFrame {
+                        callsign: source_part.into(),
+                        bandwidth,
+                        occurred: Utc::now(),
+                    });
+
                 },
                 _ => warn!("Received unknown message from modem: `{msg}`")
             }
@@ -271,7 +290,7 @@ impl Modem {
 
 
 #[derive(Debug)]
-struct State {
+pub struct State {
     /// An active write-only connection to the mercury ARQ/control port
     tcp_connection: Option<OwnedWriteHalf>,
     /// Current number of pending bytes in the ARQ transmit buffer
@@ -285,7 +304,9 @@ struct State {
     /// When we called CQ
     last_cq: Instant,
     /// The station we're connected to, if any
-    connection: Option<OpenConnection>
+    connection: Option<OpenConnection>,
+    /// A collection of CQ frames
+    pub cq_frames: VecDeque<CqFrame>
 }
 impl Default for State {
     fn default() -> State {
@@ -297,6 +318,7 @@ impl Default for State {
             ptt: false,
             last_cq: Instant::now(),
             connection: None,
+            cq_frames: VecDeque::with_capacity(MAX_CQ_FRAMES)
         }
     }
 }
@@ -339,4 +361,15 @@ impl Bandwidth {
             Bandwidth::BW2750 => "BW2750"
         }
     }
+}
+
+/// A CQ Frame received from a remote station
+#[derive(Debug, Clone)]
+pub struct CqFrame {
+    /// The callsign of the calling station
+    pub callsign: String,
+    /// The maximum bandwidth of the calling station
+    pub bandwidth: Bandwidth,
+    /// The time at which the CQFRAME was received
+    pub occurred: DateTime<Utc>,
 }

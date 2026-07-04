@@ -10,9 +10,11 @@ use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
+use chrono::Utc;
 use eframe::Frame;
-use egui::{Align, Color32, ComboBox, Layout, RichText, Separator, TextEdit, Ui, Vec2, Widget, WidgetText};
+use egui::{Align, Button, Color32, ComboBox, Label, Layout, RichText, Sense, Separator, TextEdit, Ui, Vec2, Widget, WidgetText};
 use egui_dock::{DockArea, DockState, Style, TabPath};
+use egui_extras::{Column, TableBuilder};
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, EnumIter, IntoEnumIterator};
 use tokio::runtime::{Handle, Runtime};
@@ -430,7 +432,75 @@ impl egui_dock::TabViewer for TabViewer<'_> {
                 ui.heading("Welcome to Hydra, a TNC for the Mercury modem");
             }
             Tab::Monitor => {
-                ui.label("Todo");
+
+                // CQFRAMES Table
+                TableBuilder::new(ui)
+                    .striped(true)
+                    .stick_to_bottom(true)
+                    .auto_shrink(false)
+                    .resizable(true)
+                    .column(Column::initial(72.0).at_least(48.0))
+                    .column(Column::auto().at_least(64.0))
+                    .column(Column::initial(148.0).at_least(136.0))
+                    .column(Column::remainder())
+                    .header(14.0, |mut header| {
+                        header.col(|ui| {
+                            ui.strong("Callsign");
+                        });
+                        header.col(|ui| {
+                            ui.strong("Bandwidth");
+                        });
+                        header.col(|ui| {
+                            ui.strong("Occurred");
+                        });
+                        header.col(|ui| {});
+                    })
+                    .body(|mut body| {
+                        // Lock the frames vec
+                        let frames = &self.state.modem.state.blocking_read().cq_frames;
+                        // Get the current time in UTC. This is used to determine how long since a frame was received
+                        let now = Utc::now();
+                        // Get station connection status
+                        let station_connected = self.state.modem.is_station_connected();
+
+                        // Render the rows
+                        body.rows(14.0, frames.len(), |mut row| {
+
+                            // Get the frame for this row. Normally this would be unsafe behavior but since we acquired a read lock, we should be safe to directly index the frames vec
+                            let frame = &frames[row.index()];
+
+                            // Callsign
+                            row.col(|ui| {
+                                Label::new(&frame.callsign)
+                                    .truncate()
+                                    .ui(ui);
+                            });
+                            // Bandwidth
+                            row.col(|ui| {
+                                Label::new(frame.bandwidth.as_bw_stripped())
+                                    .truncate()
+                                    .ui(ui);
+                            });
+                            // Timestamp/Occurred at
+                            row.col(|ui| {
+                                let seconds_since = frame.occurred.signed_duration_since(now).num_seconds().unsigned_abs();
+                                Label::new(format!("{} ({}s ago)", frame.occurred.format("%H:%M:%S %-m/%-d"), seconds_since))
+                                    .truncate()
+                                    .ui(ui);
+                            });
+                            // Actions
+                            row.col(|ui| {
+                                // A button to connect to the station that called CQ. This is only enabled if we aren't already connected to a station
+                                let b = Button::new("CONNECT").small();
+                                if ui.add_enabled(!station_connected, b).clicked() {
+                                    self.state.destination_callsign = frame.callsign.clone();
+                                    self.state.modem.connect(&self.config.callsign, &self.state.destination_callsign);
+                                };
+                            });
+
+                        });
+                    });
+
             }
         }
     }
