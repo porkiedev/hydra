@@ -32,8 +32,8 @@ impl Default for Modem {
 impl Modem {
     /// Whether we're connected to mercury or not
     pub fn is_mercury_connected(&self) -> bool { self.state.blocking_read().tcp_connection.is_some() }
-    /// Whether we're connected to another station or not
-    pub fn is_connected(&self) -> bool { self.state.blocking_read().connection.is_some() }
+    /// The station we're connected to, if any
+    pub fn get_connected_station(&self) -> Option<OpenConnection> { self.state.blocking_read().connection.clone() }
     /// Whether we're on cooldown from calling CQ
     pub fn is_cq_on_cooldown(&self) -> bool { Instant::now().duration_since(self.state.blocking_read().last_cq).as_millis() < CQ_DURATION_MILLIS }
     /// Whether PTT is enabled according to mercury
@@ -302,14 +302,14 @@ impl Default for State {
 }
 
 /// Represents an open connection with a target station
-#[derive(Debug)]
-struct OpenConnection {
+#[derive(Debug, Clone)]
+pub struct OpenConnection {
     /// The callsign of the station that initiated the connection
-    source_call: String,
+    pub source_call: String,
     /// The callsign of the destination station
-    destination_call: String,
+    pub destination_call: String,
     /// The negotiated bandwidth between both stations
-    bandwidth: Bandwidth
+    pub bandwidth: Bandwidth
 }
 
 /// Supported bandwidth modes by mercury

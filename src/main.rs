@@ -50,7 +50,7 @@ fn main() -> Result<()> {
         },
         Box::new(|cc| {Ok(Box::new(Hydra {
             rt,
-            tree: DockState::new(vec![Tab::ModemConnection]),
+            tree: DockState::new(vec![Tab::Monitor]),
             config,
             state: HydraState::default()
         }))})
@@ -111,10 +111,24 @@ impl eframe::App for Hydra {
         egui::Panel::top("modem_bar").exact_size(46.0).show(ui, |ui| {
             // Determine if the modem is connected, and if we're connected to another station
             let mercury_connected = self.state.modem.is_mercury_connected();
-            let station_connected = self.state.modem.is_connected();
+            let station = self.state.modem.get_connected_station();
+            let station_connected = station.is_some();
 
             ui.with_layout(Layout::left_to_right(Align::LEFT), |ui| {
-                ui.strong("Mercury");
+
+                // Mercury heading and PTT feedback
+                ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
+                    ui.set_max_width(48.0);
+                    ui.strong("Mercury");
+
+                    // The current PTT state, centered and justified
+                    ui.vertical_centered(|ui| {
+                        match self.state.modem.get_ptt_state() {
+                            true => ui.label(RichText::new("TX").color(Color32::DARK_RED)),
+                            false => ui.label(RichText::new("RX").color(Color32::DARK_GREEN)),
+                        };
+                    });
+                });
 
                 ui.separator();
 
@@ -154,11 +168,12 @@ impl eframe::App for Hydra {
                                         };
 
                                     }
-                                });
+                                }).response
+                                .on_hover_text("The maximum RF bandwidth of your station. When establishing a connection, the negotiated bandwidth will be the lower of the two stations");
 
                             // Listen checkbox
                             if ui.checkbox(&mut self.state.modem_listen, "Listen")
-                                .on_hover_text("Enter the LISTENING state and accept incoming CALL frames addressed to your callsign")
+                                .on_hover_text("Listen for and accept incoming CALL frames addressed to your callsign")
                                 .clicked() {
                                 self.state.modem.set_listen(self.state.modem_listen);
                             }
@@ -175,9 +190,6 @@ impl eframe::App for Hydra {
 
                     // The bottom half (destination callsign, cq call, etc.)
                     ui.with_layout(Layout::left_to_right(Align::LEFT), |ui| {
-
-                        let station_connected = self.state.modem.is_connected();
-
                         ui.add_enabled_ui(mercury_connected, |ui| {
 
                             // The destination callsign textbox
@@ -191,14 +203,18 @@ impl eframe::App for Hydra {
                             // Connect/Disconnect from target station button
                             match station_connected {
                                 true => {
-                                    if ui.button("Disconnect from station").clicked() {
+                                    if ui.button("Disconnect from station")
+                                        .on_hover_text("Initiates a healthy disconnect with the remote station")
+                                        .clicked() {
                                         self.state.modem.disconnect();
                                     }
                                 }
                                 false => {
                                     // Enable button only if a destination callsign was specified
                                     ui.add_enabled_ui(!self.state.destination_callsign.is_empty(), |ui| {
-                                        if ui.button("Connect to station").clicked() {
+                                        if ui.button("Connect to station")
+                                            .on_hover_text("Attempts to establish a connection with the remote station")
+                                            .clicked() {
                                             self.state.modem.connect(&self.config.callsign, &self.state.destination_callsign);
                                         }
                                     });
@@ -213,7 +229,9 @@ impl eframe::App for Hydra {
                             });
 
                             // Abort connection button
-                            if station_connected && ui.button("Abort").clicked() {
+                            if station_connected && ui.button("Abort")
+                                .on_hover_text("Aborts the connection with the remote station. This does not send a DISCONNECT frame to the remote station. Don't do this unless necessary")
+                                .clicked() {
                                 self.state.modem.abort();
                             }
                         });
@@ -223,17 +241,29 @@ impl eframe::App for Hydra {
                 ui.separator();
 
                 // Informational fields
+                if let Some(s) = station {
+                    ui.with_layout(Layout::top_down(Align::TOP), |ui| {
+                        // Shows the station we're connected to, and the negotiated RFBW
+                        ui.with_layout(Layout::left_to_right(Align::LEFT), |ui| {
+                            ui.label(format!("Connected: {} -> {} | RFBW: {}Hz",
+                                             s.source_call,
+                                             s.destination_call,
+                                             s.bandwidth.as_bw_stripped()
+                            ));
+                        });
+                        // Shows the latest SNR measurement, the number of bytes in the TX queue, the negotiated mode, and its corresponding bitrate
+                        ui.with_layout(Layout::left_to_right(Align::LEFT), |ui| {
 
-                // The current PTT state
-                match self.state.modem.get_ptt_state() {
-                    true => ui.label(RichText::new("TX").color(Color32::DARK_RED)),
-                    false => ui.label(RichText::new("RX").color(Color32::DARK_GREEN)),
-                };
+                            ui.label(format!("SNR: {:.1}dB | Queued for TX: {} | Mode: {} | BPS: {}",
+                                             self.state.modem.get_snr(),
+                                             self.state.modem.get_tx_buffer_len(),
+                                             self.state.modem.get_mode(),
+                                             self.state.modem.get_bitrate()
+                            ));
 
-                ui.label(format!("Queued for TX: {}", self.state.modem.get_tx_buffer_len()));
-                ui.label(format!("SNR: {:.1}dB", self.state.modem.get_snr()));
-                ui.label(format!("Current mode: {}", self.state.modem.get_mode()));
-                ui.label(format!("Current throughput: {}", self.state.modem.get_bitrate()));
+                        });
+                    });
+                }
 
             });
 
@@ -364,8 +394,6 @@ impl Default for HydraState {
 enum Tab {
     /// Welcomes the user
     Welcome,
-    /// For controlling and connecting to the mercury modem
-    ModemConnection,
     /// Overall Packet monitor
     Monitor,
 }
@@ -380,7 +408,6 @@ impl Tab {
     fn brief(&self) -> &'static str {
         match self {
             Tab::Welcome => "Welcome",
-            Tab::ModemConnection => "Modem",
             Tab::Monitor => "Monitor",
         }
     }
@@ -401,11 +428,6 @@ impl egui_dock::TabViewer for TabViewer<'_> {
         match tab {
             Tab::Welcome => {
                 ui.heading("Welcome to Hydra, a TNC for the Mercury modem");
-            }
-            Tab::ModemConnection => {
-
-                // TODO: Remove entirely. ModemConnection will not be a tab, it will always be visible on a top bar
-
             }
             Tab::Monitor => {
                 ui.label("Todo");
