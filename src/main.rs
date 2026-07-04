@@ -11,7 +11,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use eframe::Frame;
-use egui::{Align, ComboBox, Layout, RichText, Ui, WidgetText};
+use egui::{Align, Color32, ComboBox, Layout, RichText, Separator, TextEdit, Ui, Vec2, Widget, WidgetText};
 use egui_dock::{DockArea, DockState, Style, TabPath};
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, EnumIter, IntoEnumIterator};
@@ -72,7 +72,7 @@ impl eframe::App for Hydra {
     fn ui(&mut self, ui: &mut Ui, frame: &mut Frame) {
 
         // Top/menu bar
-        egui::Panel::top("menu_bar").show(ui, |ui| {
+        egui::Panel::top("menu_bar").exact_size(23.0).show(ui, |ui| {
             ui.with_layout(Layout::left_to_right(Align::LEFT), |ui| {
 
                 // Shows the current station callsign
@@ -105,6 +105,138 @@ impl eframe::App for Hydra {
                         }
                     });
             });
+        });
+
+        // Modem bar
+        egui::Panel::top("modem_bar").exact_size(46.0).show(ui, |ui| {
+            // Determine if the modem is connected, and if we're connected to another station
+            let mercury_connected = self.state.modem.is_mercury_connected();
+            let station_connected = self.state.modem.is_connected();
+
+            ui.with_layout(Layout::left_to_right(Align::LEFT), |ui| {
+                ui.strong("Mercury");
+
+                ui.separator();
+
+                // Input fields
+                ui.with_layout(Layout::top_down(Align::TOP), |ui| {
+                    // The top half (mercury connection, mercury settings, etc.)
+                    ui.with_layout(Layout::left_to_right(Align::LEFT), |ui| {
+                        // Connect/Disconnect from mercury button
+                        if mercury_connected {
+                            if ui.button("Disconnect").clicked() { self.state.modem.disconnect_mercury() };
+                        }
+                        else {
+                            if ui.button("Connect").clicked() {
+                                self.state.modem.connect_mercury(
+                                    format!("{}:{}", self.config.mercury_host, self.config.mercury_base_port),
+                                    self.config.callsign.clone(),
+                                    self.state.modem_listen,
+                                    self.config.mercury_bandwidth
+                                );
+                            };
+                        }
+
+                        ui.add_enabled_ui(mercury_connected, |ui| {
+
+                            // Bandwidth selection
+                            ComboBox::from_id_salt("bandwidth_combobox")
+                                .selected_text("Bandwidth")
+                                .show_ui(ui, |ui| {
+                                    for opt in Bandwidth::iter() {
+                                        if ui.selectable_label(opt == self.config.mercury_bandwidth, opt.as_bw_stripped()).clicked() {
+                                            // Update bandwidth
+                                            self.config.mercury_bandwidth = opt;
+                                            self.state.modem.set_bandwidth(opt);
+                                            if let Err(e) = self.config.save() {
+                                                error!("Failed to save config: {e}");
+                                            }
+                                        };
+
+                                    }
+                                });
+
+                            // Listen checkbox
+                            if ui.checkbox(&mut self.state.modem_listen, "Listen")
+                                .on_hover_text("Enter the LISTENING state and accept incoming CALL frames addressed to your callsign")
+                                .clicked() {
+                                self.state.modem.set_listen(self.state.modem_listen);
+                            }
+
+                            // Public checkbox
+                            if ui.checkbox(&mut self.state.modem_public, "Public")
+                                .on_hover_text("Accept incoming CALL frames regardless of the destination callsign")
+                                .clicked() {
+                                self.state.modem.set_public(self.state.modem_public);
+                            }
+
+                        });
+                    });
+
+                    // The bottom half (destination callsign, cq call, etc.)
+                    ui.with_layout(Layout::left_to_right(Align::LEFT), |ui| {
+
+                        let station_connected = self.state.modem.is_connected();
+
+                        ui.add_enabled_ui(mercury_connected, |ui| {
+
+                            // The destination callsign textbox
+                            let w = TextEdit::singleline(&mut self.state.destination_callsign)
+                                .desired_width(110.0)
+                                .hint_text("Destination");
+                            // Disable the textbox if we're already connected
+                            ui.add_enabled(!station_connected, w)
+                                .on_hover_text("The callsign of the station you want to connect to");
+
+                            // Connect/Disconnect from target station button
+                            match station_connected {
+                                true => {
+                                    if ui.button("Disconnect from station").clicked() {
+                                        self.state.modem.disconnect();
+                                    }
+                                }
+                                false => {
+                                    // Enable button only if a destination callsign was specified
+                                    ui.add_enabled_ui(!self.state.destination_callsign.is_empty(), |ui| {
+                                        if ui.button("Connect to station").clicked() {
+                                            self.state.modem.connect(&self.config.callsign, &self.state.destination_callsign);
+                                        }
+                                    });
+                                }
+                            };
+
+                            // Call CQ button
+                            ui.add_enabled_ui(!self.state.modem.is_cq_on_cooldown(), |ui| {
+                                if !station_connected && ui.button("Call CQ").clicked() {
+                                    self.state.modem.send_cq(&self.config.callsign, self.config.mercury_bandwidth);
+                                }
+                            });
+
+                            // Abort connection button
+                            if station_connected && ui.button("Abort").clicked() {
+                                self.state.modem.abort();
+                            }
+                        });
+                    });
+                });
+
+                ui.separator();
+
+                // Informational fields
+
+                // The current PTT state
+                match self.state.modem.get_ptt_state() {
+                    true => ui.label(RichText::new("TX").color(Color32::DARK_RED)),
+                    false => ui.label(RichText::new("RX").color(Color32::DARK_GREEN)),
+                };
+
+                ui.label(format!("Queued for TX: {}", self.state.modem.get_tx_buffer_len()));
+                ui.label(format!("SNR: {:.1}dB", self.state.modem.get_snr()));
+                ui.label(format!("Current mode: {}", self.state.modem.get_mode()));
+                ui.label(format!("Current throughput: {}", self.state.modem.get_bitrate()));
+
+            });
+
         });
 
         // Central panel/tabbed layout
@@ -221,7 +353,7 @@ impl Default for HydraState {
     fn default() -> Self {
         Self {
             modem: Modem::default(),
-            modem_listen: false,
+            modem_listen: true,
             modem_public: false,
             destination_callsign: String::new(),
         }
@@ -272,75 +404,7 @@ impl egui_dock::TabViewer for TabViewer<'_> {
             }
             Tab::ModemConnection => {
 
-                // Determine if the modem is connected
-                let mercury_connected = self.state.modem.is_mercury_connected();
-
-                // Connect/Disconnect from mercury button
-                if mercury_connected {
-                    if ui.button("Disconnect").clicked() { self.state.modem.disconnect_mercury() };
-                }
-                else {
-                    if ui.button("Connect").clicked() {
-                        self.state.modem.connect_mercury(
-                            format!("{}:{}", self.config.mercury_host, self.config.mercury_base_port),
-                            self.config.callsign.clone(),
-                            true,
-                            self.config.mercury_bandwidth
-                        );
-                    };
-                }
-
-                // Only enable the various configuration widgets if we are connected to the modem
-                ui.add_enabled_ui(mercury_connected, |ui| {
-
-                    // Bandwidth selection
-                    ComboBox::from_id_salt("bandwidth_combobox")
-                        .selected_text("Bandwidth")
-                        .show_ui(ui, |ui| {
-                            for opt in Bandwidth::iter() {
-                                if ui.selectable_label(opt == self.config.mercury_bandwidth, opt.to_string()).clicked() {
-                                    // Update bandwidth
-                                    self.config.mercury_bandwidth = opt;
-                                    self.state.modem.set_bandwidth(opt);
-                                    if let Err(e) = self.config.save() {
-                                        error!("Failed to save config: {e}");
-                                    }
-                                };
-
-                            }
-                        });
-
-                    // Listen checkbox
-                    if ui.checkbox(&mut self.state.modem_listen, "Listen")
-                        .on_hover_text("Enter the LISTENING state and accept incoming CALL frames addressed to your callsign")
-                        .clicked() {
-                        self.state.modem.set_listen(self.state.modem_listen);
-                    }
-
-                    // Public checkbox
-                    if ui.checkbox(&mut self.state.modem_public, "Public")
-                        .on_hover_text("Accept incoming CALL frames regardless of the destination callsign")
-                        .clicked() {
-                        self.state.modem.set_public(self.state.modem_public);
-                    }
-
-                    ui.separator();
-
-                    ui.label(format!("Bytes remaining in buffer: {}", self.state.modem.get_tx_buffer_len()));
-
-                    ui.separator();
-
-                    ui.label("Destination callsign");
-                    ui.text_edit_singleline(&mut self.state.destination_callsign);
-                    let station_connected = self.state.modem.is_connected();
-                    if station_connected && ui.button("Disconnect from station").clicked() {
-                        self.state.modem.disconnect();
-                    }
-                    else if ui.button("Connect to station").clicked() {
-                        self.state.modem.connect(&self.config.callsign, &self.state.destination_callsign);
-                    }
-
-                });
+                // TODO: Remove entirely. ModemConnection will not be a tab, it will always be visible on a top bar
 
             }
             Tab::Monitor => {

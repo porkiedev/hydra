@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::Instant;
 use poll_promise::Promise;
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, trace, warn};
@@ -10,6 +11,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::RwLock;
+
+/// A rough estimate of how long it takes for mercury to send a PENDING response to a CQFRAME request
+const CQ_DURATION_MILLIS: u128 = 2500;
 
 /// A handle to interface with the mercury modem
 ///
@@ -30,7 +34,20 @@ impl Modem {
     pub fn is_mercury_connected(&self) -> bool { self.state.blocking_read().tcp_connection.is_some() }
     /// Whether we're connected to another station or not
     pub fn is_connected(&self) -> bool { self.state.blocking_read().connection.is_some() }
-
+    /// Whether we're on cooldown from calling CQ
+    pub fn is_cq_on_cooldown(&self) -> bool { Instant::now().duration_since(self.state.blocking_read().last_cq).as_millis() < CQ_DURATION_MILLIS }
+    /// Whether PTT is enabled according to mercury
+    pub fn get_ptt_state(&self) -> bool { self.state.blocking_read().ptt }
+    /// Returns the number of bytes remaining in the TX buffer
+    pub fn get_tx_buffer_len(&self) -> usize {
+        self.state.blocking_read().buffer_len
+    }
+    /// Returns the latest measured SNR
+    pub fn get_snr(&self) -> f32 { self.state.blocking_read().snr }
+    /// Returns the current mode
+    pub fn get_mode(&self) -> String { self.state.blocking_read().bitrate.0.clone() }
+    /// Returns the current bitrate relative to the current mode
+    pub fn get_bitrate(&self) -> usize { self.state.blocking_read().bitrate.1 }
     /// Attempt to connect to mercury
     ///
     /// - `destination` is the ip:port of mercury
@@ -63,7 +80,7 @@ impl Modem {
             };
             write.write_all(format!("LISTEN {l}\r").as_bytes()).await?;
             // Set bandwidth
-            write.write_all(format!("{bandwidth}\r").as_bytes()).await?;
+            write.write_all(format!("{}\r", bandwidth.as_bw()).as_bytes()).await?;
 
             // Save write half of the stream for later use
             s.write().await.tcp_connection = Some(write);
@@ -80,6 +97,7 @@ impl Modem {
         let s = self.state.clone();
         Promise::spawn_async(async move {
             s.write().await.tcp_connection = None;
+            s.write().await.connection = None;
         });
     }
     /// Send disconnect request to remote station
@@ -98,9 +116,17 @@ impl Modem {
     pub fn abort(&mut self) {
         self.write_to_control("ABORT".into())
     }
+    /// Send a CQ frame
+    pub fn send_cq(&mut self, source: &str, bandwidth: Bandwidth) {
+        // Only send CQ if it's been a while since the last one
+        if Instant::now().duration_since(self.state.blocking_read().last_cq).as_millis() > CQ_DURATION_MILLIS {
+            self.write_to_control(format!("CQFRAME {source} {}", bandwidth.as_bw_stripped()));
+            self.state.blocking_write().last_cq = Instant::now();
+        }
+    }
     /// Set the maximum channel bandwidth
     pub fn set_bandwidth(&mut self, bandwidth: Bandwidth) {
-        self.write_to_control(bandwidth.to_string());
+        self.write_to_control(bandwidth.as_bw().into());
     }
     /// Set the listen state
     pub fn set_listen(&mut self, listen: bool) {
@@ -117,10 +143,6 @@ impl Modem {
             false => "OFF"
         };
         self.write_to_control(format!("PUBLIC {p}"));
-    }
-    /// Gets the number of bytes remaining in the TX buffer
-    pub fn get_tx_buffer_len(&self) -> usize {
-        self.state.blocking_read().buffer_len
     }
 
     // Utility Functions //
@@ -195,7 +217,7 @@ impl Modem {
                         }
                     };
                     s.write().await.ptt = ptt;
-                    trace!("Received PTT state from mercury: {ptt}");
+                    trace!("Received PTT state: {ptt}");
                 },
                 "CONNECTED" => {
                     // Keep track of the station we're connected to
@@ -203,7 +225,7 @@ impl Modem {
                     let Some(destination_part) = parts.next() else { continue };
                     let Some(bandwidth_part) = parts.next() else { continue };
                     let Ok(bandwidth) = serde_plain::from_str::<Bandwidth>(bandwidth_part) else {
-                        warn!("Received unknown bandwidth value from mercury during a CONNECTED update: {bandwidth_part}");
+                        warn!("Received unknown bandwidth value from a CONNECTED packet: {bandwidth_part}");
                         continue;
                     };
                     s.write().await.connection = Some(OpenConnection {
@@ -218,6 +240,24 @@ impl Modem {
                     s.write().await.connection = None;
                     info!("Disconnected from remote station")
                 },
+                "PENDING" => {
+                    // The PENDING event is only sent by mercury when a CQ frame is being sent, or when there's an incoming connection
+                    // Thus, if a PENDING event is received and a CQFRAME has not been sent relatively recently, we assume that it's an incoming connection request
+                    if Instant::now().duration_since(s.read().await.last_cq).as_millis() > CQ_DURATION_MILLIS {
+                        info!("Incoming connection request...");
+                    }
+                },
+                "CANCELPENDING" => {},
+                "CQFRAME" => {
+                    // Keep track of stations calling CQ
+                    let Some(source_part) = parts.next() else { continue };
+                    let Some(bandwidth_part) = parts.next() else { continue };
+                    let Ok(bandwidth) = serde_plain::from_str::<Bandwidth>(bandwidth_part) else {
+                        warn!("Received unknown bandwidth value from a CQFRAME packet: {bandwidth_part}");
+                        continue;
+                    };
+                    trace!("Received CQFRAME from {source_part} (BW: {bandwidth_part}");
+                },
                 _ => warn!("Received unknown message from modem: `{msg}`")
             }
         }
@@ -230,7 +270,7 @@ impl Modem {
 
 
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct State {
     /// An active write-only connection to the mercury ARQ/control port
     tcp_connection: Option<OwnedWriteHalf>,
@@ -242,8 +282,23 @@ struct State {
     bitrate: (String, usize),
     /// Whether PTT is engaged
     ptt: bool,
+    /// When we called CQ
+    last_cq: Instant,
     /// The station we're connected to, if any
     connection: Option<OpenConnection>
+}
+impl Default for State {
+    fn default() -> State {
+        Self {
+            tcp_connection: None,
+            buffer_len: 0,
+            snr: 0.0,
+            bitrate: ("".to_string(), 0),
+            ptt: false,
+            last_cq: Instant::now(),
+            connection: None,
+        }
+    }
 }
 
 /// Represents an open connection with a target station
@@ -258,7 +313,7 @@ struct OpenConnection {
 }
 
 /// Supported bandwidth modes by mercury
-#[derive(Debug, EnumIter, Display, PartialEq, Copy, Clone, Serialize, Deserialize)]
+#[derive(Debug, EnumIter, PartialEq, Copy, Clone, Serialize, Deserialize)]
 pub enum Bandwidth {
     #[serde(alias = "500")]
     BW500,
@@ -266,4 +321,22 @@ pub enum Bandwidth {
     BW2300,
     #[serde(alias = "2750")]
     BW2750
+}
+impl Bandwidth {
+    /// Returns the bandwidth without the BW prefix, i.e. `BW500` returns `500`
+    pub fn as_bw_stripped (&self) -> &'static str {
+        match self {
+            Bandwidth::BW500 => "500",
+            Bandwidth::BW2300 => "2300",
+            Bandwidth::BW2750 => "2750"
+        }
+    }
+    /// Returns the bandwidth with the BW prefix, i.e. `BW500` returns `BW500`
+    pub fn as_bw(&self) -> &'static str {
+        match self {
+            Bandwidth::BW500 => "BW500",
+            Bandwidth::BW2300 => "BW2300",
+            Bandwidth::BW2750 => "BW2750"
+        }
+    }
 }
